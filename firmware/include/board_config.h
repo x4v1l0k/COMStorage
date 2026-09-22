@@ -56,7 +56,7 @@ static const int PIN_QWIIC_RX = 44;
 #endif
 
 #ifndef COMSTORAGE_CHUNK_SIZE
-#define COMSTORAGE_CHUNK_SIZE 4096
+#define COMSTORAGE_CHUNK_SIZE 1024
 #endif
 
 #ifndef COMSTORAGE_CMD_TIMEOUT_MS

@@ -19,8 +19,9 @@ except ImportError as exc:  # pragma: no cover
 PROTOCOL_VERSION = "1.0"
 DEFAULT_BAUD = 115200
 DEFAULT_TIMEOUT = 30.0
-CHUNK_SIZE = 4096
+CHUNK_SIZE = 1024
 MAX_LINE = 65536
+WRITE_SLICE = 256
 
 LOG = logging.getLogger("comstorage")
 
@@ -107,7 +108,12 @@ class ComStorageClient:
                 raise ComStorageError("response line too long")
         raise ComStorageError("timeout waiting for JSON response")
 
-    def _wait_status(self, request_id: int, accept_ready: bool = False) -> dict[str, Any]:
+    def _wait_status(
+        self,
+        request_id: int,
+        accept_ready: bool = False,
+        accept_chunk_ok: bool = False,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
         while True:
             obj = self._readline_json(deadline)
@@ -120,6 +126,10 @@ class ComStorageClient:
             status = obj.get("status")
             if status == "ready":
                 if accept_ready:
+                    return obj
+                continue
+            if status == "chunk_ok":
+                if accept_chunk_ok:
                     return obj
                 continue
             if status in ("ok", "error"):
@@ -172,8 +182,19 @@ class ComStorageClient:
 
     def _write_exact(self, data: bytes) -> None:
         assert self._ser is not None
-        self._ser.write(data)
+        offset = 0
+        while offset < len(data):
+            n = self._ser.write(data[offset : offset + WRITE_SLICE])
+            if not n:
+                raise ComStorageError("serial write returned 0")
+            offset += n
         self._ser.flush()
+
+    def _reset_buffers(self) -> None:
+        assert self._ser is not None
+        time.sleep(0.05)
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
 
     def info(self) -> dict[str, Any]:
         return self.request("info")
@@ -280,25 +301,43 @@ class ComStorageClient:
         size = data_path.stat().st_size
         rid, ready = self.request_ready("put", path=remote_path, size=size)
         chunk_size = int(ready.get("chunk_size", CHUNK_SIZE))
-        LOG.info("Uploading %s -> %s (%s bytes)", local_path, remote_path, size)
+        use_ack = bool(ready.get("chunk_ack", False))
+        LOG.info(
+            "Uploading %s -> %s (%s bytes, chunk=%s, ack=%s)",
+            local_path,
+            remote_path,
+            size,
+            chunk_size,
+            use_ack,
+        )
 
         sent = 0
-        with data_path.open("rb") as fh:
-            while sent < size:
-                chunk = fh.read(chunk_size)
-                if not chunk:
-                    break
-                hdr = struct.pack("<I", len(chunk))
-                crc = struct.pack("<I", crc32_bytes(chunk))
-                self._write_exact(hdr + chunk + crc)
-                sent += len(chunk)
-                if progress:
-                    progress(sent, size)
+        try:
+            with data_path.open("rb") as fh:
+                while sent < size:
+                    chunk = fh.read(chunk_size)
+                    if not chunk:
+                        break
+                    hdr = struct.pack("<I", len(chunk))
+                    crc = struct.pack("<I", crc32_bytes(chunk))
+                    self._write_exact(hdr + chunk + crc)
+                    sent += len(chunk)
+                    if use_ack:
+                        ack = self._wait_status(rid, accept_chunk_ok=True)
+                        if ack.get("status") == "error":
+                            raise ComStorageError(f"put failed: {ack}")
+                        if ack.get("status") != "chunk_ok":
+                            raise ComStorageError(f"expected chunk_ok, got {ack}")
+                    if progress:
+                        progress(sent, size)
 
-        done = self._wait_status(rid, accept_ready=False)
-        if done.get("status") == "error":
-            raise ComStorageError(f"put failed: {done}")
-        return done
+            done = self._wait_status(rid, accept_ready=False)
+            if done.get("status") == "error":
+                raise ComStorageError(f"put failed: {done}")
+            return done
+        except Exception:
+            self._reset_buffers()
+            raise
 
 
 def list_serial_ports() -> list[dict[str, Any]]:

@@ -36,6 +36,20 @@ uint32_t readU32LE(const uint8_t *src) {
   return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
 
+// Keep transfer buffer off the task stack (put/get used to allocate 4 KiB locally).
+alignas(4) uint8_t gTransferBuf[COMSTORAGE_CHUNK_SIZE];
+
+void drainSerialRx(uint32_t windowMs) {
+  const uint32_t start = millis();
+  while (millis() - start < windowMs) {
+    while (Serial.available() > 0) {
+      (void)Serial.read();
+    }
+    delay(1);
+    yield();
+  }
+}
+
 }  // namespace
 
 ProtocolServer::ProtocolServer(StorageBackend *storage, StatusDisplay *display)
@@ -626,7 +640,7 @@ void ProtocolServer::cmdGet(JsonDocument &req) {
   sendJson(ready);
 
   transferActive_ = true;
-  uint8_t buf[COMSTORAGE_CHUNK_SIZE];
+  uint8_t *buf = gTransferBuf;
   uint8_t hdr[4];
   uint8_t crcBuf[4];
   uint32_t totalCrc = crc32util::init();
@@ -718,39 +732,45 @@ void ProtocolServer::cmdPut(JsonDocument &req) {
   ready["path"] = path;
   ready["size"] = size;
   ready["chunk_size"] = COMSTORAGE_CHUNK_SIZE;
+  ready["chunk_ack"] = true;
   sendJson(ready);
 
   transferActive_ = true;
-  uint8_t buf[COMSTORAGE_CHUNK_SIZE];
+  uint8_t *buf = gTransferBuf;
   uint8_t hdr[4];
   uint8_t crcBuf[4];
   uint64_t received = 0;
   uint32_t totalCrc = crc32util::init();
   uint32_t chunkErrors = 0;
   bool failed = false;
+  const char *failReason = nullptr;
 
   while (received < size) {
     if (!readExact(hdr, 4, COMSTORAGE_CMD_TIMEOUT_MS)) {
       failed = true;
+      failReason = "timeout_header";
       break;
     }
     const uint32_t chunkLen = readU32LE(hdr);
     if (chunkLen == 0) {
-      // unexpected early EOS
       failed = true;
+      failReason = "unexpected_eos";
       break;
     }
     if (chunkLen > COMSTORAGE_CHUNK_SIZE || received + chunkLen > size) {
       failed = true;
       chunkErrors++;
+      failReason = "bad_chunk_length";
       break;
     }
     if (!readExact(buf, chunkLen, COMSTORAGE_CMD_TIMEOUT_MS)) {
       failed = true;
+      failReason = "timeout_payload";
       break;
     }
     if (!readExact(crcBuf, 4, COMSTORAGE_CMD_TIMEOUT_MS)) {
       failed = true;
+      failReason = "timeout_crc";
       break;
     }
     const uint32_t gotCrc = readU32LE(crcBuf);
@@ -758,19 +778,32 @@ void ProtocolServer::cmdPut(JsonDocument &req) {
     if (gotCrc != calcCrc) {
       chunkErrors++;
       failed = true;
+      failReason = "chunk_crc";
       break;
     }
     if (out.write(buf, chunkLen) != chunkLen) {
       failed = true;
+      failReason = "sd_write";
       break;
     }
     totalCrc = crc32util::update(totalCrc, buf, chunkLen);
     received += chunkLen;
+
+    // Pace the host: CDC RX overruns without back-pressure look like CRC errors.
+    JsonDocument ack;
+    ack["status"] = "chunk_ok";
+    ack["request_id"] = rid;
+    ack["received"] = received;
+    sendJson(ack);
     yield();
   }
   out.flush();
   out.close();
   transferActive_ = false;
+
+  if (failed) {
+    drainSerialRx(250);
+  }
 
   const uint32_t finalCrc = crc32util::finalize(totalCrc);
 
@@ -785,7 +818,7 @@ void ProtocolServer::cmdPut(JsonDocument &req) {
     storage_->remove(path);
     done["status"] = "error";
     done["error"] = "transfer_failed";
-    done["message"] = "incomplete or corrupt transfer";
+    done["message"] = failReason ? failReason : "incomplete or corrupt transfer";
     uiFailure();
   } else if (hasCrc && finalCrc != expectedCrc) {
     storage_->remove(path);

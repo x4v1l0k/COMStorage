@@ -43,6 +43,10 @@ void setup() {
   gDisplay.setStatus(UiStatus::Booting);
   gDisplay.setBackend("SD");
 
+  // USB CDC RX defaults are tiny (~256 B). Host bursts of put-chunks will
+  // overrun and look like CRC / length failures (bytes_written=0, chunk_errors=1).
+  Serial.setRxBufferSize(16384);
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
   delay(800);
 

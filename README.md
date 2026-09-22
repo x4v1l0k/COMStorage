@@ -153,6 +153,7 @@ More detail:
 
 1. **Control plane:** one JSON object per line (`\n`-terminated UTF-8).  
 2. **Data plane:** after `get`/`put` ready, little-endian chunks: `u32 length` + payload + `u32 crc32`.
+   On `put`, the device ACKs each chunk (`chunk_ok`) so USB CDC RX does not overrun.
 
 Allowlisted commands only — no remote shell, no code execution:
 

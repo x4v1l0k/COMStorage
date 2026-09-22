@@ -76,9 +76,12 @@ Todas las peticiones deberían incluir `request_id` (entero).
 ### put
 
 1. Cliente → `{"cmd":"put","request_id":10,"path":"/f.bin","size":1234,"crc32":...}`
-2. Dispositivo → `{"status":"ready","request_id":10,"size":1234,"chunk_size":4096}`
-3. Cliente envía uno o más chunks hasta `size` bytes
-4. Dispositivo → `{"status":"ok","request_id":10,"bytes_written":1234,"crc32":...}`
+2. Dispositivo → `{"status":"ready","request_id":10,"size":1234,"chunk_size":1024,"chunk_ack":true}`
+3. Cliente envía **un** chunk y espera `{"status":"chunk_ok","request_id":10,"received":N}`
+4. Repetir hasta completar `size` bytes
+5. Dispositivo → `{"status":"ok","request_id":10,"bytes_written":1234,"crc32":...}`
+
+> `chunk_ack` evita overrun del buffer RX del USB CDC en el ESP32-S3 (síntoma típico: `bytes_written=0`, `chunk_errors=1`).
 
 ### get
 
@@ -106,10 +109,10 @@ uint32 crc32   // CRC32 IEEE del data del chunk
 - Rechazo: `..`, `\`, `C:\...`, caracteres especiales
 - Jail al filesystem montado (raíz virtual `/`)
 - `COMSTORAGE_MAX_FILE_SIZE` (default 12 MiB)
-- `COMSTORAGE_CHUNK_SIZE` 4096
+- `COMSTORAGE_CHUNK_SIZE` 1024
 - `COMSTORAGE_RX_LINE_MAX` 512
 - Timeouts de lectura binaria
-- CRC por chunk; CRC de fichero opcional en `put`
+- CRC por chunk; ACK por chunk en `put` (`chunk_ok`); CRC de fichero opcional en `put`
 - Sin comandos de ejecución / shell / Wi-Fi / flash raw
 
 ## Eventos asíncronos
